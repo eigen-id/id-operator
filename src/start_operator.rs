@@ -11,19 +11,22 @@ use once_cell::sync::Lazy;
 use rand::RngCore;
 use reqwest::Url;
 // use SimpleSidetreeManager::Anchor;
-use alloy_primitives::{eip191_hash_message, Address, FixedBytes, U256};
+use alloy_primitives::{Address, FixedBytes, U256};
+use alloy_provider::fillers::{
+    ChainIdFiller, FillProvider, GasFiller, JoinFill, NonceFiller, SignerFiller,
+};
 use alloy_signer::Signer;
 use alloy_signer_wallet::LocalWallet;
+use anyhow::Result;
 use eigen_client_elcontracts::{
     reader::ELChainReader,
     writer::{ELChainWriter, Operator},
 };
-use eyre::Result;
-
-use alloy_provider::fillers::{
-    ChainIdFiller, FillProvider, GasFiller, JoinFill, NonceFiller, SignerFiller,
-};
+use std::sync::Arc;
 use std::{env, str::FromStr};
+use tokio::sync::Mutex;
+use tokio::task;
+use vade_evan::{VadeEvan, VadeEvanConfig, DEFAULT_SIGNER, DEFAULT_TARGET};
 use ECDSAStakeRegistry::SignatureWithSaltAndExpiry;
 
 sol!(
@@ -41,8 +44,8 @@ static KEY: Lazy<String> =
 pub static RPC_URL: Lazy<String> =
     Lazy::new(|| env::var("RPC_URL").expect("failed to get rpc url from env"));
 
-pub static HELLO_WORLD_CONTRACT_ADDRESS: Lazy<String> = Lazy::new(|| {
-    env::var("CONTRACT_ADDRESS").expect("failed to get hello world contract address from env")
+pub static SIDETREE_DID_CONTRACT_ADDRESS: Lazy<String> = Lazy::new(|| {
+    env::var("CONTRACT_ADDRESS").expect("failed to get sidetree did contract address from env")
 });
 
 static DELEGATION_MANAGER_CONTRACT_ADDRESS: Lazy<String> = Lazy::new(|| {
@@ -59,7 +62,7 @@ static AVS_DIRECTORY_CONTRACT_ADDRESS: Lazy<String> = Lazy::new(|| {
     env::var("AVS_DIRECTORY_ADDRESS")
         .expect("failed to get delegation manager contract address from env")
 });
-async fn sign_and_response_to_task(
+async fn sign_and_response_to_anchor(
     transation_reference: U256,
     anchor_hash: FixedBytes<32>,
 ) -> Result<()> {
@@ -69,13 +72,15 @@ async fn sign_and_response_to_task(
 
     let signature = wallet.sign_hash(&anchor_hash).await?;
 
-    println!("Signing and responding to task : {:?}", anchor_hash);
-    let hello_world_contract_address = Address::from_str(&HELLO_WORLD_CONTRACT_ADDRESS)
-        .expect("wrong hello world contract address");
-    let hello_world_contract =
-        SimpleSidetreeManager::new(hello_world_contract_address, &provider);
+    println!(
+        "Signing and responding to anchoring transaction : {:?}",
+        anchor_hash
+    );
+    let side_tree_did_contract_address =
+        Address::from_str(&SIDETREE_DID_CONTRACT_ADDRESS).expect("wrong sidetree contract address");
+    let side_tree_did_contract = SimpleSidetreeManager::new(side_tree_did_contract_address, &provider);
 
-    hello_world_contract
+    side_tree_did_contract
         .verifyAnchor(
             transation_reference,
             anchor_hash,
@@ -91,19 +96,41 @@ async fn sign_and_response_to_task(
     Ok(())
 }
 
-/// Monitor new tasks
-async fn monitor_new_tasks() -> Result<()> {
+async fn sign_and_verify_did_operation(did_suffix: FixedBytes<32>) -> Result<()> {
     let provider = get_provider_with_wallet(KEY.clone());
 
-    let hello_world_contract_address = Address::from_str(&HELLO_WORLD_CONTRACT_ADDRESS)
-        .expect("wrong hello world contract address");
+    let wallet = LocalWallet::from_str(&KEY.clone()).expect("failed to generate wallet ");
+
+    let signature = wallet.sign_hash(&did_suffix).await?;
+
+    println!("Signing and responding to did operation : {:?}", did_suffix);
+    let sidetree_did_contract_address = Address::from_str(&SIDETREE_DID_CONTRACT_ADDRESS)
+        .expect("wrong sidetree did contract address");
+    let sidetree_did_contract = SimpleSidetreeManager::new(sidetree_did_contract_address, &provider);
+
+    sidetree_did_contract
+        .verifyDIDOperation(did_suffix, signature.as_bytes().into())
+        .gas_price(20000000000)
+        .gas(300000)
+        .send()
+        .await?
+        .get_receipt()
+        .await?;
+    println!("Did Operation Verified by operator");
+    Ok(())
+}
+/// Monitor new did operations
+async fn monitor_new_did_operations(plugin: Arc<Mutex<VadeEvan>>) -> Result<()> {
+    let provider = get_provider_with_wallet(KEY.clone());
+
+    let sidetree_did_contract_address = Address::from_str(&SIDETREE_DID_CONTRACT_ADDRESS)
+        .expect("wrong sidetree_did contract address");
     println!(
-        "hello world contrat address:{:?}",
-        hello_world_contract_address
+        "sidetree_did contrat address:{:?}",
+        sidetree_did_contract_address
     );
-    let hello_world_contract =
-        SimpleSidetreeManager::new(hello_world_contract_address, &provider);
-    println!("hello contract :{:?}", hello_world_contract);
+    let sidetree_did_contract = SimpleSidetreeManager::new(sidetree_did_contract_address, &provider);
+    println!("sidetree_did contract :{:?}", sidetree_did_contract);
     // let word: &str = "EigenWorld";
 
     // // If you want to send this tx to holesky , please uncomment the gas price and gas limit
@@ -119,47 +146,98 @@ async fn monitor_new_tasks() -> Result<()> {
     let mut latest_processed_block = provider.get_block_number().await?;
 
     loop {
-        println!("Monitoring for new tasks...");
-
+        println!("Monitoring for new did operations..");
+        let current_block = provider.get_block_number().await?;
         let filter = Filter::new()
-            .address(hello_world_contract_address)
+            .address(sidetree_did_contract_address)
             .from_block(BlockNumberOrTag::Number(latest_processed_block));
         let logs = provider.get_logs(&filter).await?;
-        println!("logs {:?}", logs);
         for log in logs {
-            println!("log topic {:?}", log.topic0());
             match log.topic0() {
-                Some(&SimpleSidetreeManager::Anchor::SIGNATURE_HASH) => {
-                    let SimpleSidetreeManager::Anchor { anchorFileHash, transactionNumber, numberOfOperations } = log
-                        .log_decode()
-                        .expect("Failed to decode log new sidetree anchor")
-                        .inner
-                        .data;
-                    println!("New anchorHash and transaction number :{:?} {:?}", anchorFileHash, transactionNumber);
+                // Some(&SimpleSidetreeManager::Anchor::SIGNATURE_HASH) => {
+                //     let SimpleSidetreeManager::Anchor {
+                //         anchorFileHash,
+                //         transactionNumber,
+                //         numberOfOperations,
+                //     } = log
+                //         .log_decode()
+                //         .expect("Failed to decode log new sidetree anchor")
+                //         .inner
+                //         .data;
+                //     println!(
+                //         "New anchorHash and transaction number :{:?} {:?}",
+                //         anchorFileHash, transactionNumber
+                //     );
 
-                    let _ = sign_and_response_to_task(transactionNumber, anchorFileHash)
-                        .await;
-                },
-
+                //     let _ = sign_and_response_to_task(transactionNumber, anchorFileHash).await;
+                // }
                 Some(&SimpleSidetreeManager::NewDIDOperation::SIGNATURE_HASH) => {
-                    let SimpleSidetreeManager::NewDIDOperation { didSuffix} = log
+                    let SimpleSidetreeManager::NewDIDOperation { didSuffix } = log
                         .log_decode()
                         .expect("Failed to decode log new sidetree anchor")
                         .inner
                         .data;
-                    println!("New did operation suffix :{:?}", didSuffix);
 
-                    // resolve did 
-                       
-                    // verify operation by signing it
+                    // resolve did
+                    // Lock the plugin and clone or extract what you need
+                    let did = {
+                        let prefix: [u8; 2] = [0x12, 0x20];
+                        let mut combined: [u8; 34] = [0; 34];
+                        combined[..2].copy_from_slice(&prefix);
+                        combined[2..].copy_from_slice(&didSuffix.0);
+
+                        let did = base64::encode_config(combined, base64::URL_SAFE_NO_PAD);
+                        did
+                    }; // Lock is dropped here
+
+                    let did = format!("did:elem:eigen:{}", did);
+                    println!("resolving {}", did);
+                    // Retry the did_resolve call up to 3 times with a 20-second delay between attempts
+                    let mut attempts = 0;
+                    let result = loop {
+                        attempts += 1;
+                        let mut vade_evan = plugin.lock().await;
+                        match vade_evan.did_resolve(&did).await {
+                            Ok(res) => {
+                                if res.contains("Not Found") && attempts < 5 {
+                                    eprintln!(
+                                        "did not found, attempt {} of 5. Retrying in 60 seconds...",
+                                        attempts
+                                    );
+                                    tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
+                                } else {
+                                    break Ok(res);
+                                }
+                            } // If the call succeeds, break the loop
+                            Err(e) if attempts < 5 => {
+                                eprintln!(
+                                            "did_resolve failed, attempt {} of 5. Retrying in 60 seconds...",
+                                            attempts
+                                        );
+                                tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
+                            }
+                            Err(e) => break Err(e), // If all attempts fail, return the last error
+                        }
+                    };
+
+                    // Handle the result of the retry loop
+                    match result {
+                        Ok(res) => {
+                            println!("{}", res);
+                            // Verify operation by signing it
+                            let _ = sign_and_verify_did_operation(didSuffix).await;
+                        }
+                        Err(e) => {
+                            eprintln!("did_resolve failed after 5 attempts: {:?}", e);
+                        }
+                    }
                 }
                 _ => {}
             }
         }
 
-        tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
-        let current_block = provider.get_block_number().await?;
-        latest_processed_block = current_block;
+        tokio::time::sleep(tokio::time::Duration::from_secs(30)).await;
+        latest_processed_block = current_block + 1;
     }
 }
 
@@ -167,8 +245,8 @@ async fn register_operator() -> Result<()> {
     let wallet = LocalWallet::from_str(&KEY).expect("failed to generate wallet ");
 
     let provider = get_provider_with_wallet(KEY.clone());
-    let hello_world_contract_address = Address::from_str(&HELLO_WORLD_CONTRACT_ADDRESS)
-        .expect("wrong hello world contract address");
+    let sidetree_did_contract_address = Address::from_str(&SIDETREE_DID_CONTRACT_ADDRESS)
+        .expect("wrong sidetree_did contract address");
     let delegation_manager_contract_address =
         Address::from_str(&DELEGATION_MANAGER_CONTRACT_ADDRESS)
             .expect("wrong delegation manager contract address");
@@ -215,7 +293,7 @@ async fn register_operator() -> Result<()> {
     let digest_hash = elcontracts_reader_instance
         .calculate_operator_avs_registration_digest_hash(
             wallet.address(),
-            hello_world_contract_address,
+            sidetree_did_contract_address,
             salt,
             expiry,
         )
@@ -253,25 +331,33 @@ async fn register_operator() -> Result<()> {
     Ok(())
 }
 
-#[tokio::main]
-pub async fn main() {
+#[tokio::main(flavor = "current_thread")]
+pub async fn main() -> Result<()> {
     dotenv().ok();
+
+    let vade = VadeEvan::new(VadeEvanConfig {
+        target: DEFAULT_TARGET,
+        signer: DEFAULT_SIGNER,
+    })?;
+
     if let Err(e) = register_operator().await {
         eprintln!("Failed to register operator: {:?}", e);
-        return;
+        return Err(e);
     }
 
-    // Start the task monitoring as a separate async task to keep the process running
-    tokio::spawn(async {
-        if let Err(e) = monitor_new_tasks().await {
-            eprintln!("Failed to monitor new tasks: {:?}", e);
+    let plugin: Arc<Mutex<VadeEvan>> = Arc::new(Mutex::new(vade));
+    let local = task::LocalSet::new();
+    local.spawn_local(async move {
+        if let Err(e) = monitor_new_did_operations(plugin).await {
+            eprintln!("Failed to monitor new did operations: {:?}", e);
         }
     });
-
-    // Keep the process running indefinitely
+    local.await;
+    // // Keep the process running indefinitely
     loop {
         tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
     }
+    // return Ok(());
 }
 
 pub fn get_provider_with_wallet(

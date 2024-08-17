@@ -1,4 +1,2 @@
-// Start creating tasks and respond appropriately
-
-/// Register Operator and monitor for NewTaskCreated event
+/// Register Operator and monitor for NewDIDOperation Events
 pub mod start_operator;
